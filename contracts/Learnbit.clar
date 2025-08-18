@@ -23,13 +23,25 @@
 (define-constant ERR_INSUFFICIENT_SKILL_LEVEL (err u113))
 (define-constant ERR_INVALID_ASSESSMENT (err u114))
 (define-constant ERR_PREREQUISITE_NOT_MET (err u115))
+(define-constant ERR_TUTOR_NOT_FOUND (err u116))
+(define-constant ERR_SESSION_NOT_FOUND (err u117))
+(define-constant ERR_INVALID_SESSION_TIME (err u118))
+(define-constant ERR_SESSION_ALREADY_BOOKED (err u119))
+(define-constant ERR_NOT_SESSION_PARTICIPANT (err u120))
+(define-constant ERR_SESSION_NOT_COMPLETED (err u121))
+(define-constant ERR_TUTOR_NOT_AVAILABLE (err u122))
+(define-constant ERR_INVALID_TUTORING_RATE (err u123))
+(define-constant ERR_SESSION_ALREADY_RATED (err u124))
 (define-constant PLATFORM_FEE_PERCENT u5)
+(define-constant TUTORING_PLATFORM_FEE_PERCENT u10)
 
 (define-data-var next-course-id uint u1)
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-assessment-id uint u1)
 (define-data-var next-skill-id uint u1)
+(define-data-var next-session-id uint u1)
 (define-data-var platform-earnings uint u0)
+(define-data-var tutoring-platform-earnings uint u0)
 
 (define-map courses
   uint
@@ -144,6 +156,64 @@
     level-name: (string-ascii 20),
     min-score: uint,
     skill-points-awarded: uint
+  }
+)
+
+(define-map tutor-profiles
+  principal
+  {
+    bio: (string-ascii 300),
+    specialties: (string-ascii 200),
+    hourly-rate: uint,
+    is-available: bool,
+    total-sessions: uint,
+    total-earnings: uint,
+    average-rating: uint,
+    total-ratings: uint,
+    created-at: uint
+  }
+)
+
+(define-map tutoring-sessions
+  uint
+  {
+    tutor: principal,
+    student: (optional principal),
+    skill-id: uint,
+    duration-blocks: uint,
+    total-cost: uint,
+    scheduled-at: uint,
+    started-at: (optional uint),
+    completed-at: (optional uint),
+    is-cancelled: bool,
+    payment-released: bool
+  }
+)
+
+(define-map session-ratings
+  {session-id: uint, rater: principal}
+  {
+    rating: uint,
+    feedback: (string-ascii 200),
+    created-at: uint
+  }
+)
+
+(define-map tutor-availability
+  {tutor: principal, time-slot: uint}
+  {
+    is-available: bool,
+    max-sessions: uint,
+    current-bookings: uint
+  }
+)
+
+(define-map student-session-history
+  {student: principal, session-id: uint}
+  {
+    session-cost: uint,
+    completed: bool,
+    rating-given: bool
   }
 )
 
@@ -566,6 +636,245 @@
   )
 )
 
+(define-public (become-tutor (bio (string-ascii 300)) (specialties (string-ascii 200)) (hourly-rate uint))
+  (let
+    (
+      (current-block stacks-block-height)
+    )
+    (asserts! (> hourly-rate u0) ERR_INVALID_TUTORING_RATE)
+    (asserts! (<= hourly-rate u10000) ERR_INVALID_TUTORING_RATE)
+    
+    (map-set tutor-profiles tx-sender
+      {
+        bio: bio,
+        specialties: specialties,
+        hourly-rate: hourly-rate,
+        is-available: true,
+        total-sessions: u0,
+        total-earnings: u0,
+        average-rating: u0,
+        total-ratings: u0,
+        created-at: current-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-tutor-availability (is-available bool))
+  (let
+    (
+      (tutor-profile (unwrap! (map-get? tutor-profiles tx-sender) ERR_TUTOR_NOT_FOUND))
+    )
+    (map-set tutor-profiles tx-sender
+      (merge tutor-profile {is-available: is-available})
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-tutoring-session (skill-id uint) (duration-blocks uint) (scheduled-at uint))
+  (let
+    (
+      (session-id (var-get next-session-id))
+      (tutor-profile (unwrap! (map-get? tutor-profiles tx-sender) ERR_TUTOR_NOT_FOUND))
+      (skill (unwrap! (map-get? skills skill-id) ERR_SKILL_NOT_FOUND))
+      (total-cost (* (get hourly-rate tutor-profile) duration-blocks))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-available tutor-profile) ERR_TUTOR_NOT_AVAILABLE)
+    (asserts! (get is-active skill) ERR_SKILL_NOT_FOUND)
+    (asserts! (> duration-blocks u0) ERR_INVALID_SESSION_TIME)
+    (asserts! (> scheduled-at current-block) ERR_INVALID_SESSION_TIME)
+    
+    (map-set tutoring-sessions session-id
+      {
+        tutor: tx-sender,
+        student: none,
+        skill-id: skill-id,
+        duration-blocks: duration-blocks,
+        total-cost: total-cost,
+        scheduled-at: scheduled-at,
+        started-at: none,
+        completed-at: none,
+        is-cancelled: false,
+        payment-released: false
+      }
+    )
+    (var-set next-session-id (+ session-id u1))
+    (ok session-id)
+  )
+)
+
+(define-public (book-tutoring-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions session-id) ERR_SESSION_NOT_FOUND))
+      (tutor-profile (unwrap! (map-get? tutor-profiles (get tutor session)) ERR_TUTOR_NOT_FOUND))
+      (session-cost (get total-cost session))
+      (platform-fee (/ (* session-cost TUTORING_PLATFORM_FEE_PERCENT) u100))
+      (tutor-payment (- session-cost platform-fee))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-none (get student session)) ERR_SESSION_ALREADY_BOOKED)
+    (asserts! (not (get is-cancelled session)) ERR_SESSION_NOT_FOUND)
+    (asserts! (> (get scheduled-at session) current-block) ERR_INVALID_SESSION_TIME)
+    (asserts! (>= (stx-get-balance tx-sender) session-cost) ERR_INSUFFICIENT_PAYMENT)
+    
+    (try! (stx-transfer? session-cost tx-sender (as-contract tx-sender)))
+    
+    (map-set tutoring-sessions session-id
+      (merge session {student: (some tx-sender)})
+    )
+    
+    (map-set student-session-history {student: tx-sender, session-id: session-id}
+      {
+        session-cost: session-cost,
+        completed: false,
+        rating-given: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (start-tutoring-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions session-id) ERR_SESSION_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (or (is-eq tx-sender (get tutor session)) 
+                  (is-eq (some tx-sender) (get student session))) ERR_NOT_SESSION_PARTICIPANT)
+    (asserts! (is-some (get student session)) ERR_SESSION_NOT_FOUND)
+    (asserts! (is-none (get started-at session)) ERR_SESSION_ALREADY_BOOKED)
+    (asserts! (not (get is-cancelled session)) ERR_SESSION_NOT_FOUND)
+    
+    (map-set tutoring-sessions session-id
+      (merge session {started-at: (some current-block)})
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-tutoring-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions session-id) ERR_SESSION_NOT_FOUND))
+      (tutor-profile (unwrap! (map-get? tutor-profiles (get tutor session)) ERR_TUTOR_NOT_FOUND))
+      (session-cost (get total-cost session))
+      (platform-fee (/ (* session-cost TUTORING_PLATFORM_FEE_PERCENT) u100))
+      (tutor-payment (- session-cost platform-fee))
+      (current-block stacks-block-height)
+      (student (unwrap! (get student session) ERR_SESSION_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get tutor session)) 
+                  (is-eq tx-sender student)) ERR_NOT_SESSION_PARTICIPANT)
+    (asserts! (is-some (get started-at session)) ERR_SESSION_NOT_COMPLETED)
+    (asserts! (is-none (get completed-at session)) ERR_SESSION_ALREADY_BOOKED)
+    (asserts! (not (get payment-released session)) ERR_SESSION_ALREADY_BOOKED)
+    
+    (try! (as-contract (stx-transfer? tutor-payment tx-sender (get tutor session))))
+    (var-set tutoring-platform-earnings (+ (var-get tutoring-platform-earnings) platform-fee))
+    
+    (map-set tutoring-sessions session-id
+      (merge session {
+        completed-at: (some current-block),
+        payment-released: true
+      })
+    )
+    
+    (map-set tutor-profiles (get tutor session)
+      (merge tutor-profile {
+        total-sessions: (+ (get total-sessions tutor-profile) u1),
+        total-earnings: (+ (get total-earnings tutor-profile) tutor-payment)
+      })
+    )
+    
+    (map-set student-session-history {student: student, session-id: session-id}
+      (merge 
+        (unwrap! (map-get? student-session-history {student: student, session-id: session-id}) ERR_SESSION_NOT_FOUND)
+        {completed: true}
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (rate-tutor (session-id uint) (rating uint) (feedback (string-ascii 200)))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions session-id) ERR_SESSION_NOT_FOUND))
+      (tutor-profile (unwrap! (map-get? tutor-profiles (get tutor session)) ERR_TUTOR_NOT_FOUND))
+      (student (unwrap! (get student session) ERR_SESSION_NOT_FOUND))
+      (session-history (unwrap! (map-get? student-session-history {student: tx-sender, session-id: session-id}) ERR_SESSION_NOT_FOUND))
+      (rating-key {session-id: session-id, rater: tx-sender})
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender student) ERR_NOT_SESSION_PARTICIPANT)
+    (asserts! (get completed session-history) ERR_SESSION_NOT_COMPLETED)
+    (asserts! (not (get rating-given session-history)) ERR_SESSION_ALREADY_RATED)
+    (asserts! (>= rating u1) ERR_INVALID_ASSESSMENT)
+    (asserts! (<= rating u5) ERR_INVALID_ASSESSMENT)
+    (asserts! (is-some (get completed-at session)) ERR_SESSION_NOT_COMPLETED)
+    (asserts! (is-none (map-get? session-ratings rating-key)) ERR_SESSION_ALREADY_RATED)
+    
+    (map-set session-ratings rating-key
+      {
+        rating: rating,
+        feedback: feedback,
+        created-at: current-block
+      }
+    )
+    
+    (let
+      (
+        (total-ratings (+ (get total-ratings tutor-profile) u1))
+        (current-total (+ (* (get average-rating tutor-profile) (get total-ratings tutor-profile)) rating))
+        (new-average (/ current-total total-ratings))
+      )
+      (map-set tutor-profiles (get tutor session)
+        (merge tutor-profile {
+          average-rating: new-average,
+          total-ratings: total-ratings
+        })
+      )
+    )
+    
+    (map-set student-session-history {student: tx-sender, session-id: session-id}
+      (merge session-history {rating-given: true})
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-tutoring-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions session-id) ERR_SESSION_NOT_FOUND))
+      (current-block stacks-block-height)
+      (student (get student session))
+    )
+    (asserts! (or (is-eq tx-sender (get tutor session))
+                  (and (is-some student) (is-eq tx-sender (unwrap-panic student)))) ERR_NOT_SESSION_PARTICIPANT)
+    (asserts! (is-none (get started-at session)) ERR_SESSION_ALREADY_BOOKED)
+    (asserts! (not (get is-cancelled session)) ERR_SESSION_NOT_FOUND)
+    
+    (if (is-some student)
+      (begin
+        (try! (as-contract (stx-transfer? (get total-cost session) tx-sender (unwrap-panic student))))
+        true
+      )
+      true
+    )
+    
+    (map-set tutoring-sessions session-id
+      (merge session {is-cancelled: true})
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-course (course-id uint))
   (map-get? courses course-id)
 )
@@ -680,3 +989,62 @@
 (define-read-only (get-next-assessment-id)
   (var-get next-assessment-id)
 )
+
+(define-read-only (get-tutor-profile (tutor principal))
+  (map-get? tutor-profiles tutor)
+)
+
+(define-read-only (get-tutoring-session (session-id uint))
+  (map-get? tutoring-sessions session-id)
+)
+
+(define-read-only (get-session-rating (session-id uint) (rater principal))
+  (map-get? session-ratings {session-id: session-id, rater: rater})
+)
+
+(define-read-only (get-student-session-history (student principal) (session-id uint))
+  (map-get? student-session-history {student: student, session-id: session-id})
+)
+
+(define-read-only (is-tutor (user principal))
+  (is-some (map-get? tutor-profiles user))
+)
+
+(define-read-only (get-tutor-availability (tutor principal) (time-slot uint))
+  (map-get? tutor-availability {tutor: tutor, time-slot: time-slot})
+)
+
+(define-read-only (get-tutoring-platform-earnings)
+  (var-get tutoring-platform-earnings)
+)
+
+(define-read-only (get-next-session-id)
+  (var-get next-session-id)
+)
+
+(define-read-only (is-session-participant (session-id uint) (user principal))
+  (match (map-get? tutoring-sessions session-id)
+    session (or (is-eq user (get tutor session))
+                (is-eq (some user) (get student session)))
+    false
+  )
+)
+
+(define-read-only (get-available-tutors-count (skill-id uint))
+  u0
+)
+
+(define-read-only (calculate-session-cost (tutor principal) (duration-blocks uint))
+  (match (map-get? tutor-profiles tutor)
+    profile (* (get hourly-rate profile) duration-blocks)
+    u0
+  )
+)
+
+
+
+
+
+
+
+
